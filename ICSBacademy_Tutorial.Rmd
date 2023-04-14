@@ -1,0 +1,334 @@
+---
+title: "Immune cell profiling from single cell RNA with R"
+author: 'Team: Meghana Kshirsagar, Gauri Vaidya and Yang Ye'
+date: "April 14, 2023"
+abstract: "Over the past couple of decades, immunotherapy treatments have been widely adopted as an alternative treatment for a variety of cancers. The study of tumour microenvironment of immune cells such as macrophages, T cells and B cells amongst others can help to unravel the mystery of differential outcomes to immunotherapy treatments. Gene expression profiling can help to identify the patterns of genes expressed in major immune cells amongst cohorts of patients at different stages of cancer to generate new biological hypotheses. Statistical approaches can facilitate the identification of highly variable genes and their expression in immune cells by performing analysis of scRNA sequencing data. The tutorial will be divided in three parts; comparing the popular annotation tools, applying dimensionality reduction techniques to obtain multi-stage downstreaming of scRNA data and extracting crucial insights  from immune cell populations and subpopulations. Throughout the tutorial we will follow the seurat pipeline version 4.0."
+output: html_notebook
+---
+
+## Introduction
+In this tutorial, we perform comparative analysis of different annotation tools for scRNA-seq data. The annotation tools are compared on the basis of their ability to correctly label the celltypes and the respective marker genes. We demonstrate the workflow using gastric cancer dataset throughout the tutorial.
+
+### Load libraries
+Install the relevant R libraries 
+```{r library load, message=FALSE, warning=FALSE}
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+library(GEOquery)
+library(R.utils)
+library(scCustomize)
+library(gridExtra)
+library(DESeq2)
+library(celldex)
+library(ggpubr)
+library(SingleR)
+library(scMRMA)
+library(SeuratWrappers)
+library(Nebulosa)
+library(dittoSeq)
+set.seed(1000)
+```
+
+
+### Load Dataset
+We will use throughout this vignette, publicly available single-cell RNA-seq dataset provided by [Zhang et al.](https://doi.org/10.1016/j.celrep.2019.04.052). The dataset is available in the Gene Expression Omnibus with Accession Number [GSE134520](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE134520). 
+
+In this study, 13 samples of patients diagnosed with gastritis, intestinal metaplasia or early gastric cancer are provided.  
+
+
+```{r create seurat, results='hide'}
+merged_seurat <- readRDS('gastric_dataset.rds')
+```
+
+## Quality Control and Filtering
+
+We will follow the recommendations for quality control and filtering parameters as mentioned by [Zhang et. al](https://doi.org/10.1016/j.celrep.2019.04.052).
+
+```{r qc, results='hide'}
+# get row names of the seurat object
+merged_seurat$sample <- rownames(merged_seurat@meta.data)
+
+merged_seurat@meta.data <- separate(merged_seurat@meta.data, col = 'sample', into = c('Patient', 'Barcode'), sep = '__')
+
+# specify patient and type of diagnosis
+Patient = c("patient1", "patient2", "patient3", 
+            "patient4", "patient5", "patient6"  , "patient7",
+            "patient8", "patient9", "patient10",
+            "patient11", "patient12", "patient13")
+
+values <- c("NAG", "NAG", "NAG", "CAG", "CAG", "CAG", "IMW", "IMW", "IMS", "IMS", "IMS", "IMS", "EGC")
+```
+
+
+```{r qc, results='hide'}
+# add column in seurat object to specify the type of the patient
+merged_seurat$type <- values[match(merged_seurat$Patient, Patient)]
+
+# calculate the percentage of mitochondrial and ribosomal genes
+
+merged_seurat$mitoPercent <- PercentageFeatureSet(merged_seurat, pattern="^MT-")
+merged_seurat$riboPercent <- PercentageFeatureSet(merged_seurat, pattern="^RPL")
+
+```
+
+```{r qc2, results='hide'}
+# filter the object
+merged_seurat_filtered <- subset(merged_seurat, subset = nFeature_RNA > 400 & nFeature_RNA < 7000 & mitoPercent < 20 & riboPercent < 20)
+```
+
+## Data processing and normalization of the gene expression matrix using Seurat pipeline 
+
+In this section, we pretty much follow [the vignette from Seurat](https://satijalab.org/seurat/archive/v3.1/pbmc3k_tutorial.html) for the preprocessing of the scRNA We perform a standard scRNA-seq normalization and processing: 
+1. NormalizeData
+2. FindVariableFeatures
+3. ScaleData
+4. RunPCA
+5. RunUMAP
+
+We perform library size normalization by rescaling counts to a common library size of 10000.
+
+
+```{r processing, results='hide'}
+# Library-size normalization, log-transformation, and centering and scaling of gene expression values
+merged_seurat_filtered <- NormalizeData(object = merged_seurat_filtered, normalization.method = "LogNormalize", scale.factor = 10000)
+merged_seurat_filtered <- FindVariableFeatures(object = merged_seurat_filtered, mean.function = ExpMean, dispersion.function = LogVMR,x.low.cutoff = 0.05, x.high.cutoff = 5, y.cutoff = 0.5, do.plot = T)
+
+# run the standard Seurat workflow for clustering and visualisation
+# scale data
+merged_seurat_filtered <- ScaleData(object = merged_seurat_filtered, do.scale = T,do.center = T)
+```
+## Dimensionality Reduction using PCA and UMAP
+
+We perform dimensionality reduction using Principal Component Analysis (PCA) and Uniform Manifold Approximation and Projection (UMAP). The Seurat function RunPCA() is used to perform dimensionality reduction.
+
+```{r dim reduction1}
+merged_seurat_filtered <- RunPCA(object = merged_seurat_filtered) 
+```
+
+The command ElbowPlot is used to plot the standard deviations of the principal components for easy identification of an elbow in the graph. This elbow often corresponds well with the significant dims.
+
+```{r dim reduction2}
+# validate the variance of PCA across dimensions
+ElbowPlot(merged_seurat_filtered, ndims = 20)
+ElbowPlot(merged_seurat_filtered, ndims = 50)
+```
+
+As we can see from the above graph, there is not much difference in range [20, 50] dimensions. Hence, we have used the first 20 dimensions are they sufficiently cover the variance in the dataset. 
+
+```{r dim reduction3, results='hide'}
+# validate the variance of PCA across dimensions
+merged_seurat_filtered <- FindNeighbors(object = merged_seurat_filtered, dims = 1:20)
+merged_seurat_filtered <- FindClusters(object = merged_seurat_filtered)
+merged_seurat_filtered <- RunUMAP(object = merged_seurat_filtered, dims = 1:20)
+merged_seurat_filtered <- RunTSNE(object = merged_seurat_filtered, dims = 1:20)
+
+```
+
+## Batch effect correction using Canonical Correlation Analysis
+
+
+In this section, we will focus on batch correction with [Canonical Correlation Analysis](https://www.nature.com/articles/nbt.4096). We will go through the steps of 1. batch effect diagnosis, 2. actual correction.
+
+
+
+```{r batchcorrection, results='hide'}
+# DimPlot allows to visualize both cells and selected gene lists in PCA low dimensional space.
+
+UMAP_plot_Patient <- dittoDimPlot(merged_seurat_filtered, reduction.use = "umap", "Patient", do.label=TRUE, labels.size = 2) + ggtitle("Batch effects (samples)") + theme(legend.text = element_text(size = 10), aspect.ratio = 1.2) + scale_color_discrete ( name = "patients", labels= c("p1", "p2", "p3",  "p4", "p5", "p6", "p7","p8", "p9", "p10","p11", "p12", "p13"))
+UMAP_plot_Type <- dittoDimPlot(merged_seurat_filtered, reduction.use = "umap", "type") + ggtitle("Batch effects (type)") + theme(legend.text = element_text(size = 10), aspect.ratio = 1.2) + ggtitle("Batch effects (samples)") + theme(legend.text = element_text(size = 10), aspect.ratio = 1.2)
+
+ggarrange(UMAP_plot_Patient,  widths = c(1, 1))
+ggarrange(UMAP_plot_Type,  widths = c(1, 1))
+
+```
+We check that there actually is a batch effect across these datasets by checking that they cluster separately. The graphs above clearly indicate the presence of batch effects in the datasets.
+
+We will use the Canonical Correlation Analysis technique to remove the batch effect.  
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+# perform integration to correct for batch effects
+obj.list <- SplitObject(merged_seurat_filtered, split.by = 'Patient')
+for(i in 1:length(obj.list)){
+  obj.list[[i]] <- NormalizeData(object = obj.list[[i]])
+  obj.list[[i]] <- FindVariableFeatures(object = obj.list[[i]])
+}
+
+# select integration features
+features <- SelectIntegrationFeatures(object.list = obj.list)
+
+# find integration anchors (CCA)
+anchors <- FindIntegrationAnchors(object.list = obj.list,
+                                  anchor.features = features)
+# integrate data
+seurat.integrated <- IntegrateData(anchorset = anchors)
+
+# Scale data, run PCA and UMAP and visualize integrated data
+seurat.integrated <- ScaleData(object = seurat.integrated)
+seurat.integrated <- RunPCA(object = seurat.integrated)
+seurat.integrated <- RunUMAP(object = seurat.integrated, dims = 1:20)
+```
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# visualise the graphs before and after batch correction
+
+UMAP_BatchCorrectionPatient <- dittoDimPlot(seurat.integrated, reduction.use = "umap", "Patient", do.label = TRUE, labels.size = 2) + ggtitle("Batch corrected (samples)") + theme(legend.text = element_text(size = 10), aspect.ratio = 1.2) + scale_color_discrete ( name = "patients", labels= c("patient1", "patient2", "patient3",  "patient4", "patient5", "patient6", "patient7","patient8", "patient9", "patient10","patient11", "patient12", "patient13"))
+UMAP_BatchCorrectionType <- dittoDimPlot(seurat.integrated, reduction.use = 'umap', 'type') + ggtitle("Batch corrected (samples)") + theme(legend.text = element_text(size = 10), aspect.ratio = 1)
+```
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# visualise the graphs before and after batch correction
+ggarrange(UMAP_plot_Patient, UMAP_BatchCorrectionPatient, common.legend = TRUE)
+```
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# visualise the graphs before and after batch correction
+ggarrange(UMAP_plot_Type, UMAP_BatchCorrectionType, common.legend = TRUE)
+```
+
+As we can see above, cells from the batches are more intermingled in the UMAP plot. This suggests that the batch effect was removed.
+
+## Cell Type Annotations
+
+scRNA-Seq data can be annotated using two techniques: (1) manual annotation by domain experts, or (2) automated annotation using transcriptomics profiles to assign cell identities. In this tutorial, we compare the pros and cons of each of the approaches. Hence, we choose automated annotation tools such as scMRMA (Marker Gene Database Based in R), SCSA (Marker Gene Database Based in Python) and SingleR (Correlation Based in R) and compare the results against the manual annotation tool, celltypist.
+
+### Annotation with SingleR
+
+We will now annotate the clusters with SingleR, which is an annotation tool combined with Seurat, to explore scRNA-seq data. It is available to be downloaded from [Bioconductor](https://bioconductor.org/packages/release/bioc/html/SingleR.html). SingleR uses a reference dataset of scRNA-seq data with known labels, it labels new cells from a test dataset based on similarity to the reference. We used the reference database, Blueprint/ENCODE consisting of bulk RNA-seq data for pure stroma and immune cells generated by Blueprint [Martens and Stunnenberg 2013](https://doi.org/10.3324/haematol.2013.094243) and ENCODE projects [The ENCODE Project Consortium 2012](https://doi.org/10.1038/nature11247).
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+seurat.singleR <- seurat.integrated
+
+# load the BlueprintEncodeData
+dataset.ref <- BlueprintEncodeData()
+
+# convert the seurat object to SingleCellExperiment object
+seurat.singleR.sce <- as.SingleCellExperiment(seurat.singleR)
+
+# annotate the dataset with SingleR
+singleR.labels <- SingleR(test = seurat.singleR.sce ,assay.type.test = 1, ref = dataset.ref, labels = dataset.ref$label.main)
+
+# add column in the main dataset with the annotated labels
+seurat.singleR@meta.data$singleR.labels <- singleR.labels$pruned.labels
+
+# change the index of the object to the annotated labels
+seurat.singleR <- SetIdent(seurat.singleR, value = "singleR.labels")
+
+# find all the markers with the annotations with minimum log2foldchange of 2 and minimum percentage cells as 50%
+all.cluster.markers <- FindAllMarkers(seurat.singleR, logfc.threshold = log2(1.2), min.pct = 0.5)
+
+# export the labelled annotations to csv
+write.csv(all.cluster.markers, "ISCBgastric_singleR_labels.csv")
+```
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+UMAP_singleR <- DimPlot(seurat.singleR, reduction = 'umap', group.by = 'singleR.labels', label = FALSE) + ggtitle("SingleR Annotations") + theme(legend.text = element_text(size = 10), aspect.ratio = 1)
+
+ggarrange(UMAP_singleR)
+
+```
+### Annotation with scMRMA
+The final annotation tool that we will discuss in our tutorial is  scMRMA, ‘single cell Multiresolution Marker-based Annotation’ algorithm, which is a bidirectional method that maps cell clusters against a hierarchical reference by [Li et. al](https://academic.oup.com/nar/article/50/2/e7/6396893#327582259). Please note that for this annotation technique, we will not use the batch-corrected assay (to analyse the impact of batch effect on cell cluster assignment). scMRMA uses a reference database, PanglaoDB, with lists of cell-type markers for various tissue types for both human and mouse, which makes it possible to explore cell types with a list of marker genes. Furthermore, it also uses another database, TcellAI containing 22 subcelltypes of T-cells. TcellAI is a part of ImmuCellAI, which was originally collected for cancer immune cells [Miao et. al](https://doi.org/10.1002%2Fadvs.201902880). Therefore, TcellAI is very useful for annotating specific T-cell populations in cancer. In addition, scMRMA accepts user-defined references as well making it a popular choice to be investigated for automated celltype annotation.     
+
+
+```{r results='hide'}
+result <- scMRMA(input = merged_seurat_filtered,
+                 species = "Hs",
+                 db = "panglaodb",
+                 p = 0.05,
+                 normalizedData = F,
+                 selfDB = NULL,
+                 selfClusters = NULL,
+                 k=20)
+
+
+merged_seurat_filtered[["scMRMA"]] <- result$multiR$annotationResult[colnames(merged_seurat_filtered),ncol(result$multiR$annotationResult)]
+```
+
+```{r}
+UMAP_scMRMA <- DimPlot(merged_seurat_filtered,reduction = "umap",group.by = "scMRMA",repel = TRUE)+ ggtitle("scMRMA Annotations") + theme(legend.text = element_text(size = 10), aspect.ratio = 1)
+ggarrange(UMAP_scMRMA)
+```
+
+```{r results='hide'}
+result <- scMRMA(input = merged_seurat_filtered,
+                 species = "Hs",
+                 db = "TcellAI",
+                 p = 0.05,
+                 normalizedData = F,
+                 selfDB = NULL,
+                 selfClusters = NULL,
+                 k=20)
+
+
+merged_seurat_filtered[["scMRMA_TcellAI"]] <- result$multiR$annotationResult[colnames(merged_seurat_filtered),ncol(result$multiR$annotationResult)]
+```
+
+```{r}
+UMAP_scMRMA_tcellAI <- DimPlot(merged_seurat_filtered,reduction = "umap",group.by = "scMRMA_TcellAI",repel = TRUE)+ ggtitle("scMRMA Annotations with TcellAI") + theme(legend.text = element_text(size = 10), aspect.ratio = 1)
+ggarrange(UMAP_scMRMA_tcellAI)
+```
+
+### Annotation with SCSA
+SCSA is a python based annotation tool, which annotates the cell types from scRNA-seq data, based on a score annotation model combining differentially expressed genes (DEGs) and confidence levels of cell markers from both known and user-defined information by [Cao et. al](https://www.frontiersin.org/articles/10.3389/fgene.2020.00490/full). SCSA annotation can be directly applied to clustering results obtained from Seurat as well as CellRanger, making it an ideal choice for investigation in this study.
+
+Hence, we will create a .csv file with FindAllMarkers() function and give it as an input to SCSA for annotation containing the cluster results.
+
+```{r results='hide'}
+# prepare data for SCSA annotation in Python
+scsa <- seurat.integrated
+
+# seurat workflow
+scsa <- ScaleData(object = scsa)
+scsa <- FindNeighbors(scsa, dims = 1:20)
+scsa <- FindClusters(scsa)
+scsa <- SetIdent(scsa, value="seurat_clusters")
+scsa <- FindAllMarkers(scsa,logfc.threshold = log2(1.2), min.pct = 0.5)
+
+# write the results to CSV
+write.csv(scsa, 'gastric_scsa.csv')
+```
+
+
+```{python results='hide'}
+import os
+os.system("python3 /Users/orphic/Downloads/SCSA-master/SCSA.py -d /Users/orphic/Downloads/SCSA-master/whole.db -s seurat -i /Users/orphic/Downloads/SCSA-master/gastric_scsa.csv -k All -E -g Human -p 0.01 -f 1.5 > results.txt")
+```
+The results of the annotation from SCSA are saved in your working directory in results.txt file. 
+
+## Validation of annotation tools for immune cell types
+
+We compare the accuracy of annotation tools using [Nebulosa](https://academic.oup.com/bioinformatics/article/37/16/2485/6103785?login=false), an R package that uses weighted kernel density estimation to recover signals lost through drop-out or low expression for immune cell types. The marker genes for immune cell types are referenced from [31067475](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE134520#:~:text=1947.e5.%20PMID%3A-,31067475,-Zhang%20M%2C%20Feng).
+
+Individual and joint density plots for T cells with Nebulosa.
+
+```{r}
+tcell <- plot_density(merged_seurat_filtered, c("CD2", "CD3D","CD3E","CD3G"), joint = TRUE, reduction = "umap")   
+tcell + plot_layout(ncol = 2) 
+```
+
+Here, we also show an example of individual and joint density plots for T cell with Nebulosa for batch corrected seurat object.
+
+```{r}
+tcell <- plot_density(seurat.integrated, c("CD2", "CD3D","CD3E","CD3G"), joint = TRUE, reduction = "umap") + theme(text = element_text(size = 10))  
+tcell + plot_layout(ncol = 2) + theme(text = element_text(size = 10)) 
+```
+## Summary
+The major types of immune cells are lymphocytes (B cells and T cells), Natural killer Cells (NK cells), Dendritic Cells, macrophages, mast cells, monocytes, neutrophils, eosinophils and basophils. They play a crucial role in patient selection in a diverse set of immunotherapies such as cytokine therapy, adoptive cell transfer, immune checkpoint inhibitors (iCI), Cancer vaccine therapies, oncolytic virus therapies.
+
+We covered only T-cell compositions in this tutorial, and we intent to explore in future, other immune cells and their subsets to understand tumor progression.
+
+T cell compositions can provide insights into immunity strength and be helpful to understand the tumor progression and influence clinical outcomes.
+CD4+ T cells play an important role in antitumor immunity by promoting or suppressing cytotoxic T cell responses. The utility of CD4 and CD8, can be used  to predict patients who can benefit from neoadjuvant therapy using immunohistochemistry in pre-treatment biopsies. Previous studies have established that the elevated ratio between CD4+ and CD8+ lymphocytes is a promising biomarker to predict treatment response to neoadjuvant chemotherapy in locally advanced gastric cancer.
+
+
+
+```{r}
+sessionInfo()
+```
+
+
